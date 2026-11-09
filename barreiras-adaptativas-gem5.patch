@@ -1,14 +1,15 @@
 diff --git a/configs/barreira/teste_m5_barreira.py b/configs/barreira/teste_m5_barreira.py
 new file mode 100644
-index 0000000000..bcf68ee259
+index 0000000000..1f607a56c5
 --- /dev/null
 +++ b/configs/barreira/teste_m5_barreira.py
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,80 @@
 +from pathlib import Path
 +
 +import m5
 +from m5.objects import (
 +    AddrRange,
++    BarrierMonitor,
 +    DDR3_1600_8x8,
 +    MemCtrl,
 +    Process,
@@ -19,11 +20,6 @@ index 0000000000..bcf68ee259
 +    SystemXBar,
 +    TimingSimpleCPU,
 +    VoltageDomain,
-+)
-+
-+system.barrier_monitor = BarrierMonitor(
-+    participants=1,
-+    cpus=[system.cpu],
 +)
 +
 +# Localiza o executável a partir da localização deste script.
@@ -44,6 +40,11 @@ index 0000000000..bcf68ee259
 +# Uma CPU, suficiente para testar as duas chamadas.
 +system.cpu = TimingSimpleCPU()
 +system.cpu.createInterruptController()
++
++system.barrier_monitor = BarrierMonitor(
++    participants=1,
++    cpus=[system.cpu],
++)
 +
 +# Barramento que conecta CPU e memória.
 +system.membus = SystemXBar()
@@ -169,6 +170,112 @@ index 0000000000..a9f1f7654d
 +
 +print(f"Simulação encerrada no tick {m5.curTick()}.")
 +print(f"Motivo: {event.getCause()}")
+diff --git a/configs/projetos/p02/campanha_p02.py b/configs/projetos/p02/campanha_p02.py
+new file mode 100644
+index 0000000000..e2972b0592
+--- /dev/null
++++ b/configs/projetos/p02/campanha_p02.py
+@@ -0,0 +1,43 @@
++#!/usr/bin/env python3
++"""Executa a matriz mínima do Projeto 2 e registra cada comando em JSONL."""
++import argparse
++import itertools
++import json
++import subprocess
++from pathlib import Path
++
++
++def combinations():
++    for algorithm, threads, perturb in itertools.product(("central", "dissem"), (1, 2, 4, 8, 16), (1, 2, 3)):
++        for work, imbalance in itertools.product((0, 1000, 10000), (0.0, 0.5)):
++            yield "micro", algorithm, threads, work, imbalance, perturb, "timing"
++        for size in (128, 512):
++            yield "jacobi", algorithm, threads, size, 0.0, perturb, "timing"
++        yield "integ", algorithm, threads, 10000, 0.0, perturb, "timing"
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("gem5", type=Path)
++    parser.add_argument("--out", type=Path, default=Path("m5out/p02"))
++    parser.add_argument("--limiar", type=int, default=8)
++    parser.add_argument("--dry-run", action="store_true")
++    args = parser.parse_args()
++    script = Path(__file__).with_name("sistema_p02.py")
++    args.out.mkdir(parents=True, exist_ok=True)
++    log = args.out / "commands.jsonl"
++    with log.open("w") as output:
++        for index, (program, algorithm, threads, work, imbalance, perturb, cpu) in enumerate(combinations()):
++            run = args.out / f"{index:03d}-{program}-{algorithm}-p{threads}-w{work}-s{perturb}"
++            command = [str(args.gem5), "-d", str(run), str(script), "--threads", str(threads),
++                       "--alg", algorithm, "--limiar", str(args.limiar), "--prog", program,
++                       "--work", str(work), "--imbalance", str(imbalance), "--iters", "100",
++                       "--perturb", str(perturb), "--cpu", cpu]
++            output.write(json.dumps({"dir": str(run), "command": command}) + "\n")
++            output.flush()
++            if not args.dry_run:
++                subprocess.run(command, check=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/configs/projetos/p02/extrai_p02.py b/configs/projetos/p02/extrai_p02.py
+new file mode 100644
+index 0000000000..8494dfe63b
+--- /dev/null
++++ b/configs/projetos/p02/extrai_p02.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python3
++"""Extrai métricas e reprova execuções cujo monitor detectou erro."""
++import argparse
++import csv
++import re
++from pathlib import Path
++
++
++VALUE = re.compile(r"^(\S+)\s+([-+0-9.eE]+)")
++
++
++def read_stats(path):
++    stats = {}
++    for line in path.read_text(errors="replace").splitlines():
++        match = VALUE.match(line)
++        if match:
++            stats[match.group(1)] = float(match.group(2))
++    return stats
++
++
++def value(stats, suffix):
++    return sum(number for name, number in stats.items() if name.endswith(suffix))
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("root", type=Path)
++    parser.add_argument("--csv", type=Path, default=Path("p02.csv"))
++    args = parser.parse_args()
++    rows = []
++    for path in sorted(args.root.glob("*/stats.txt")):
++        stats = read_stats(path)
++        invalid = value(stats, "invalidEvents")
++        early = value(stats, "earlyDepartures")
++        episodes = value(stats, "barriersCompleted::1")
++        arrivals = value(stats, "arrivals")
++        rows.append({"run": path.parent.name, "valid": int(not invalid and not early and episodes > 0),
++                     "sim_ticks": stats.get("simTicks", 0), "episodes": episodes,
++                     "arrivals": arrivals, "early_departures": early, "invalid_events": invalid,
++                     "locked_rmws": value(stats, "lockedRMWs"),
++                     "snoop_invalidations": value(stats, "snoopInvalidations")})
++    with args.csv.open("w", newline="") as output:
++        writer = csv.DictWriter(output, fieldnames=rows[0].keys() if rows else ["run", "valid"])
++        writer.writeheader()
++        writer.writerows(rows)
++    if any(not row["valid"] for row in rows):
++        raise SystemExit("há execuções inválidas; consulte o CSV")
++
++
++if __name__ == "__main__":
++    main()
 diff --git a/configs/projetos/p02/sistema_p02.py b/configs/projetos/p02/sistema_p02.py
 new file mode 100644
 index 0000000000..3bd372abaf
@@ -911,6 +1018,54 @@ index 6815e1160b..c588be459e 100644
          warn("Unimplemented m5 op (%#x)\n", func);
          return false;
  
+diff --git a/workloads/p02/Makefile b/workloads/p02/Makefile
+new file mode 100644
+index 0000000000..bb1f0849b3
+--- /dev/null
++++ b/workloads/p02/Makefile
+@@ -0,0 +1,25 @@
++CPPFLAGS += -I../../include
++CXXFLAGS += -O2 -std=c++17 -pthread -Wall -Wextra
++
++COMMON = barreira.cc central.cc dissem.cc
++PROGRAMS = micro jacobi integ barrier_stress atomic_counter
++
++all: $(PROGRAMS)
++
++micro: micro.cc $(COMMON)
++	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -DUSE_M5OPS $^ -o $@ $(LDFLAGS)
++
++jacobi: jacobi.cc $(COMMON)
++	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -DUSE_M5OPS $^ -o $@ $(LDFLAGS)
++
++integ: integ.cc $(COMMON)
++	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -DUSE_M5OPS $^ -o $@ $(LDFLAGS)
++
++barrier_stress: barrier_stress.cc $(COMMON)
++	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
++
++atomic_counter: atomic_counter.cc
++	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -DUSE_M5OPS $< -o $@ $(LDFLAGS)
++
++clean:
++	rm -f $(PROGRAMS)
+diff --git a/workloads/p02/atomic_counter.cc b/workloads/p02/atomic_counter.cc
+new file mode 100644
+index 0000000000..cf73ed7464
+--- /dev/null
++++ b/workloads/p02/atomic_counter.cc
+@@ -0,0 +1,11 @@
++#include <atomic>
++#include <gem5/m5ops.h>
++
++int main()
++{
++    std::atomic<unsigned> value{0};
++    m5_reset_stats(0, 0);
++    for (unsigned i = 0; i < 1000; ++i) value.fetch_add(1, std::memory_order_relaxed);
++    m5_dump_stats(0, 0);
++    return value.load() != 1000;
++}
 diff --git a/workloads/p02/barreira.cc b/workloads/p02/barreira.cc
 new file mode 100644
 index 0000000000..ddc805b3c9
@@ -1012,6 +1167,42 @@ index 0000000000..0050dc5297
 +    uint64_t id,
 +    unsigned threshold
 +);
+diff --git a/workloads/p02/barrier_stress.cc b/workloads/p02/barrier_stress.cc
+new file mode 100644
+index 0000000000..42db378389
+--- /dev/null
++++ b/workloads/p02/barrier_stress.cc
+@@ -0,0 +1,30 @@
++#include <cassert>
++#include <atomic>
++#include <memory>
++#include <thread>
++#include <vector>
++
++#include "barreira.h"
++
++int main()
++{
++    for (unsigned participants : {1u, 2u, 3u, 5u, 8u}) {
++        for (Algorithm algorithm : {Algorithm::Central, Algorithm::Dissem}) {
++            auto barrier = createBarrier(algorithm, participants, 1, 4);
++            struct alignas(CACHE_LINE) Slot { std::atomic<unsigned> episode{0}; };
++            std::vector<Slot> slots(participants);
++            auto worker = [&](unsigned tid) {
++                for (unsigned episode = 1; episode <= 10000; ++episode) {
++                    slots[tid].episode.store(episode, std::memory_order_relaxed);
++                    barrier->wait(tid);
++                    for (auto &slot : slots)
++                        assert(slot.episode.load(std::memory_order_acquire) >= episode);
++                }
++            };
++            std::vector<std::thread> threads;
++            for (unsigned tid = 1; tid < participants; ++tid) threads.emplace_back(worker, tid);
++            worker(0);
++            for (auto &thread : threads) thread.join();
++        }
++    }
++}
 diff --git a/workloads/p02/central.cc b/workloads/p02/central.cc
 new file mode 100644
 index 0000000000..b607b6e9f8
@@ -1182,6 +1373,154 @@ index 0000000000..3128633720
 +    unsigned rounds;
 +    std::vector<ThreadData> threads;
 +};
+diff --git a/workloads/p02/integ.cc b/workloads/p02/integ.cc
+new file mode 100644
+index 0000000000..d3d4b135f5
+--- /dev/null
++++ b/workloads/p02/integ.cc
+@@ -0,0 +1,59 @@
++#include <cstdint>
++#include <iostream>
++#include <memory>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "barreira.h"
++#include "central.h"
++
++struct Params { unsigned threads = 4, iters = 100, work = 10000, threshold = 8; Algorithm algorithm = Algorithm::Central; };
++
++static bool parse(Params &p, int argc, char **argv)
++{
++    for (int i = 1; i < argc; i += 2) {
++        if (i + 1 == argc) return false;
++        std::string key(argv[i]), value(argv[i + 1]);
++        if (key == "--threads") p.threads = std::stoul(value);
++        else if (key == "--iters") p.iters = std::stoul(value);
++        else if (key == "--work") p.work = std::stoul(value);
++        else if (key == "--limiar") p.threshold = std::stoul(value);
++        else if (key == "--alg") p.algorithm = value == "central" ? Algorithm::Central : value == "dissem" ? Algorithm::Dissem : Algorithm::Auto;
++        else if (key != "--imbalance" && key != "--perturb") return false;
++    }
++    return p.threads && p.iters && p.work && (p.algorithm != Algorithm::Auto || p.threshold);
++}
++
++int main(int argc, char **argv)
++{
++    Params p;
++    if (!parse(p, argc, argv)) return 1;
++    auto measured = createBarrier(p.algorithm, p.threads, 1, p.threshold);
++    auto control = std::make_unique<CentralBarrier>(p.threads, P02_BARRIER_CTRL);
++    std::vector<uint64_t> partial(p.threads), result(1);
++    auto worker = [&](unsigned tid) {
++        control->wait(tid);
++#ifdef USE_M5OPS
++        if (tid == 0) m5_reset_stats(0, 0);
++#endif
++        control->wait(tid);
++        for (unsigned it = 0; it < p.iters; ++it) {
++            uint64_t sum = 0;
++            for (unsigned i = tid; i < p.work; i += p.threads) sum += uint64_t(i) * i + it;
++            partial[tid] = sum;
++            measured->wait(tid);
++            if (tid == 0) for (uint64_t value : partial) result[0] += value;
++            measured->wait(tid);
++        }
++        control->wait(tid);
++#ifdef USE_M5OPS
++        if (tid == 0) m5_dump_stats(0, 0);
++#endif
++    };
++    std::vector<std::thread> workers;
++    for (unsigned tid = 1; tid < p.threads; ++tid) workers.emplace_back(worker, tid);
++    worker(0);
++    for (auto &thread : workers) thread.join();
++    std::cout << "Resultado: " << result[0] << "\nEpisódios medidos: " << 2 * p.iters << "\n";
++}
+diff --git a/workloads/p02/jacobi.cc b/workloads/p02/jacobi.cc
+new file mode 100644
+index 0000000000..5f1cf6e2b1
+--- /dev/null
++++ b/workloads/p02/jacobi.cc
+@@ -0,0 +1,77 @@
++#include <cstdint>
++#include <iostream>
++#include <memory>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "barreira.h"
++#include "central.h"
++
++struct Params {
++    unsigned threads = 4, iters = 20, size = 128, threshold = 8;
++    Algorithm algorithm = Algorithm::Central;
++};
++
++static bool parse(Params &p, int argc, char **argv)
++{
++    for (int i = 1; i < argc; i += 2) {
++        if (i + 1 == argc) return false;
++        std::string key(argv[i]), value(argv[i + 1]);
++        if (key == "--threads") p.threads = std::stoul(value);
++        else if (key == "--iters") p.iters = std::stoul(value);
++        else if (key == "--work") p.size = std::stoul(value);
++        else if (key == "--limiar") p.threshold = std::stoul(value);
++        else if (key == "--alg") {
++            p.algorithm = value == "central" ? Algorithm::Central :
++                          value == "dissem" ? Algorithm::Dissem : Algorithm::Auto;
++        } else if (key != "--imbalance" && key != "--perturb") return false;
++    }
++    return p.threads && p.iters && p.size >= 3 &&
++           (p.algorithm != Algorithm::Auto || p.threshold);
++}
++
++int main(int argc, char **argv)
++{
++    Params p;
++    if (!parse(p, argc, argv)) return 1;
++    const size_t cells = size_t(p.size) * p.size;
++    std::vector<uint64_t> a(cells, 1), b(cells, 0);
++    for (unsigned x = 0; x < p.size; ++x)
++        a[x] = a[cells - p.size + x] = a[size_t(x) * p.size] = a[size_t(x + 1) * p.size - 1] = 100;
++    b = a;
++
++    auto measured = createBarrier(p.algorithm, p.threads, 1, p.threshold);
++    CentralBarrier control(p.threads, P02_BARRIER_CTRL);
++    auto worker = [&](unsigned tid) {
++        auto *current = &a;
++        auto *next = &b;
++        const unsigned first = 1 + (p.size - 2) * tid / p.threads;
++        const unsigned last = 1 + (p.size - 2) * (tid + 1) / p.threads;
++        control.wait(tid);
++#ifdef USE_M5OPS
++        if (tid == 0) m5_reset_stats(0, 0);
++#endif
++        control.wait(tid);
++        for (unsigned it = 0; it < p.iters; ++it) {
++            for (unsigned y = first; y < last; ++y)
++                for (unsigned x = 1; x + 1 < p.size; ++x)
++                    (*next)[size_t(y) * p.size + x] = ((*current)[size_t(y - 1) * p.size + x] +
++                        (*current)[size_t(y + 1) * p.size + x] + (*current)[size_t(y) * p.size + x - 1] +
++                        (*current)[size_t(y) * p.size + x + 1]) / 4;
++            measured->wait(tid);
++            std::swap(current, next);
++        }
++        control.wait(tid);
++#ifdef USE_M5OPS
++        if (tid == 0) m5_dump_stats(0, 0);
++#endif
++    };
++    std::vector<std::thread> workers;
++    for (unsigned tid = 1; tid < p.threads; ++tid) workers.emplace_back(worker, tid);
++    worker(0);
++    for (auto &thread : workers) thread.join();
++    uint64_t checksum = 0;
++    for (uint64_t value : (p.iters % 2 ? b : a)) checksum += value;
++    std::cout << "Resultado: " << checksum << "\nEpisódios medidos: " << p.iters << "\n";
++}
 diff --git a/workloads/p02/micro.cc b/workloads/p02/micro.cc
 new file mode 100644
 index 0000000000..5f1f39a8bc
