@@ -172,20 +172,35 @@ index 0000000000..a9f1f7654d
 +print(f"Motivo: {event.getCause()}")
 diff --git a/configs/projetos/p02/campanha_p02.py b/configs/projetos/p02/campanha_p02.py
 new file mode 100644
-index 0000000000..e2972b0592
+index 0000000000..4f7aff9049
 --- /dev/null
 +++ b/configs/projetos/p02/campanha_p02.py
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,81 @@
 +#!/usr/bin/env python3
 +"""Executa a matriz mínima do Projeto 2 e registra cada comando em JSONL."""
 +import argparse
 +import itertools
 +import json
 +import subprocess
++import sys
 +from pathlib import Path
 +
 +
-+def combinations():
++def combinations(stage="main"):
++    if stage == "smoke":
++        for program, algorithm, threads in itertools.product(
++                ("micro", "jacobi", "integ"), ("central", "dissem", "auto"), (1, 2, 4, 8, 16)):
++            yield program, algorithm, threads, 19, 0.0, 1, "timing"
++        return
++    if stage == "o3":
++        for program, algorithm, threads, perturb in itertools.product(
++                ("micro", "jacobi"), ("central", "dissem"), (4, 16), (1, 2, 3)):
++            yield program, algorithm, threads, 1000 if program == "micro" else 512, 0.0, perturb, "o3"
++        return
++    if stage == "auto":
++        for threads, perturb in itertools.product((1, 2, 4, 8, 16), (1, 2, 3)):
++            yield "jacobi", "auto", threads, 512, 0.0, perturb, "timing"
++        return
 +    for algorithm, threads, perturb in itertools.product(("central", "dissem"), (1, 2, 4, 8, 16), (1, 2, 3)):
 +        for work, imbalance in itertools.product((0, 1000, 10000), (0.0, 0.5)):
 +            yield "micro", algorithm, threads, work, imbalance, perturb, "timing"
@@ -198,55 +213,141 @@ index 0000000000..e2972b0592
 +    parser = argparse.ArgumentParser()
 +    parser.add_argument("gem5", type=Path)
 +    parser.add_argument("--out", type=Path, default=Path("m5out/p02"))
-+    parser.add_argument("--limiar", type=int, default=8)
++    parser.add_argument("--limiar", type=int)
++    parser.add_argument("--stage", choices=("main", "o3", "auto", "smoke"), default="main")
++    parser.add_argument("--iters", type=int, default=100)
++    parser.add_argument("--timeout", type=int, default=1200)
 +    parser.add_argument("--dry-run", action="store_true")
 +    args = parser.parse_args()
++    if args.iters <= 0 or args.timeout <= 0 or (args.limiar is not None and args.limiar <= 0):
++        parser.error("iterações, timeout e limiar devem ser positivos")
++    if args.stage in ("auto", "smoke") and args.limiar is None:
++        parser.error("informe --limiar (medido para a campanha auto)")
++    threshold = args.limiar or 1  # Não é usado pelos algoritmos fixos.
 +    script = Path(__file__).with_name("sistema_p02.py")
 +    args.out.mkdir(parents=True, exist_ok=True)
 +    log = args.out / "commands.jsonl"
 +    with log.open("w") as output:
-+        for index, (program, algorithm, threads, work, imbalance, perturb, cpu) in enumerate(combinations()):
-+            run = args.out / f"{index:03d}-{program}-{algorithm}-p{threads}-w{work}-s{perturb}"
++        for index, (program, algorithm, threads, work, imbalance, perturb, cpu) in enumerate(combinations(args.stage)):
++            run = args.out / f"{args.stage}-{index:03d}-{program}-{algorithm}-p{threads}-w{work}-s{perturb}"
 +            command = [str(args.gem5), "-d", str(run), str(script), "--threads", str(threads),
-+                       "--alg", algorithm, "--limiar", str(args.limiar), "--prog", program,
-+                       "--work", str(work), "--imbalance", str(imbalance), "--iters", "100",
++                       "--alg", algorithm, "--limiar", str(threshold), "--prog", program,
++                       "--work", str(work), "--imbalance", str(imbalance), "--iters", str(args.iters),
 +                       "--perturb", str(perturb), "--cpu", cpu]
 +            output.write(json.dumps({"dir": str(run), "command": command}) + "\n")
 +            output.flush()
 +            if not args.dry_run:
-+                subprocess.run(command, check=True)
++                run.mkdir(parents=True, exist_ok=False)
++                binary = script.resolve().parents[3] / "workloads/p02" / program
++                reference_command = [str(binary), "--threads", str(threads), "--iters", str(args.iters),
++                                     "--work", str(work), "--imbalance", str(imbalance),
++                                     "--perturb", str(perturb), "--sequential", "1"]
++                reference_output = subprocess.check_output(reference_command, text=True, timeout=args.timeout)
++                reference = next(line.split(":", 1)[1].strip() for line in reference_output.splitlines()
++                                 if line.startswith("Resultado:"))
++                (run / "run.json").write_text(json.dumps(dict(program=program, algorithm=algorithm,
++                    threads=threads, work=work, imbalance=imbalance, perturb=perturb, cpu=cpu,
++                    iters=args.iters, threshold=threshold, reference=reference)))
++                with (run / "stdout.txt").open("w") as stdout, (run / "stderr.txt").open("w") as stderr:
++                    subprocess.run(command, check=True, stdout=stdout, stderr=stderr, timeout=args.timeout)
++        if not args.dry_run:
++            subprocess.run([sys.executable, str(script.with_name("extrai_p02.py")),
++                            str(args.out), "--csv", str(args.out / "results.csv")], check=True)
 +
 +
 +if __name__ == "__main__":
 +    main()
 diff --git a/configs/projetos/p02/extrai_p02.py b/configs/projetos/p02/extrai_p02.py
 new file mode 100644
-index 0000000000..8494dfe63b
+index 0000000000..86c158e3cb
 --- /dev/null
 +++ b/configs/projetos/p02/extrai_p02.py
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,122 @@
 +#!/usr/bin/env python3
 +"""Extrai métricas e reprova execuções cujo monitor detectou erro."""
 +import argparse
 +import csv
++import json
++import math
 +import re
 +from pathlib import Path
 +
 +
-+VALUE = re.compile(r"^(\S+)\s+([-+0-9.eE]+)")
-+
-+
 +def read_stats(path):
 +    stats = {}
++    inside = False
 +    for line in path.read_text(errors="replace").splitlines():
-+        match = VALUE.match(line)
-+        if match:
-+            stats[match.group(1)] = float(match.group(2))
-+    return stats
++        if "Begin Simulation Statistics" in line:
++            inside = True
++            continue
++        if inside and "End Simulation Statistics" in line:
++            return stats
++        fields = line.split()
++        if inside and len(fields) >= 2 and not line.lstrip().startswith("#"):
++            stats[fields[0]] = float(fields[1])
++    raise ValueError(f"ROI sem bloco completo: {path}")
 +
 +
 +def value(stats, suffix):
 +    return sum(number for name, number in stats.items() if name.endswith(suffix))
++
++
++def result(text):
++    return next(line.split(":", 1)[1].strip() for line in text.splitlines()
++                if line.startswith("Resultado:"))
++
++
++def extract(path):
++    stats = read_stats(path)
++    meta = json.loads((path.parent / "run.json").read_text())
++    output = (path.parent / "stdout.txt").read_text()
++    episodes = meta["iters"] * (2 if meta["program"] == "integ" else 1)
++    monitor = "system.barrier_monitor."
++    arrivals = [v for k, v in stats.items()
++                if k == monitor + "arrivals" or k.startswith(monitor + "arrivals::")]
++    completed = sum(v for k, v in stats.items()
++                    if k.startswith(monitor + "barriersCompleted::")
++                    and k.rsplit("::", 1)[1] not in ("0", "total"))
++    errors = []
++    if result(output) != meta["reference"]:
++        errors.append("resultado difere da referência sequencial")
++    declared = re.search(r"Episódios medidos: (\d+)", output)
++    if not declared or int(declared[1]) != episodes or completed != episodes:
++        errors.append("contagem de episódios incorreta")
++    if len(arrivals) != meta["threads"] or any(v != episodes for v in arrivals):
++        errors.append("chegadas por contexto incorretas")
++    for key in ("earlyDepartures", "invalidEvents"):
++        if stats.get(monitor + key) != 0:
++            errors.append(key)
++    if stats.get(monitor + "releaseLatency::samples") != episodes:
++        errors.append("amostras de liberação incorretas")
++    ticks = stats["simTicks"]
++    if not math.isfinite(ticks) or ticks <= 0:
++        errors.append("tempo da ROI inválido")
++    l1_rmw = sum(v for k, v in stats.items()
++                 if re.fullmatch(r"system\.cpu\d*\.dcache\.lockedRMWs::total", k))
++    corrected_rmw = l1_rmw - 2 * meta["threads"]
++    selected = meta["algorithm"]
++    if selected == "auto":
++        selected = "dissem" if meta["threads"] >= meta["threshold"] else "central"
++    expected_rmw = episodes * meta["threads"] if selected == "central" else 0
++    if corrected_rmw != expected_rmw:
++        errors.append("RMWs L1 incompatíveis com o algoritmo")
++    row = {"run": path.parent.name, **meta, "valid": int(not errors),
++           "errors": "; ".join(errors), "sim_ticks": ticks,
++           "ticks_per_iteration": ticks / meta["iters"], "episodes": completed,
++           "l1_rmws_per_episode": corrected_rmw / episodes,
++           "l2_rmws_per_episode": value(stats, "l2.lockedRMWs::total") / episodes,
++           "l1_invalidations_per_episode": sum(v for k, v in stats.items()
++                if re.fullmatch(r"system\.cpu\d*\.dcache\.snoopInvalidations", k)) / episodes,
++           "l1d_misses_per_episode": sum(v for k, v in stats.items()
++                if re.fullmatch(r"system\.cpu\d*\.dcache\.overallMisses::total", k)) / episodes,
++           "wait_fraction": sum(v for k, v in stats.items()
++                if k == monitor + "waitTicks" or k.startswith(monitor + "waitTicks::"))
++                / (meta["threads"] * ticks)}
++    for key in ("releaseLatency", "arrivalSpread", "waitDist"):
++        row[key + "_mean"] = stats.get(monitor + key + "::mean", float("nan"))
++    return row
 +
 +
 +def main():
@@ -255,19 +356,27 @@ index 0000000000..8494dfe63b
 +    parser.add_argument("--csv", type=Path, default=Path("p02.csv"))
 +    args = parser.parse_args()
 +    rows = []
-+    for path in sorted(args.root.glob("*/stats.txt")):
-+        stats = read_stats(path)
-+        invalid = value(stats, "invalidEvents")
-+        early = value(stats, "earlyDepartures")
-+        episodes = value(stats, "barriersCompleted::1")
-+        arrivals = value(stats, "arrivals")
-+        rows.append({"run": path.parent.name, "valid": int(not invalid and not early and episodes > 0),
-+                     "sim_ticks": stats.get("simTicks", 0), "episodes": episodes,
-+                     "arrivals": arrivals, "early_departures": early, "invalid_events": invalid,
-+                     "locked_rmws": value(stats, "lockedRMWs"),
-+                     "snoop_invalidations": value(stats, "snoopInvalidations")})
++    for metadata in sorted(args.root.glob("*/run.json")):
++        path = metadata.parent / "stats.txt"
++        try:
++            rows.append(extract(path))
++        except (ValueError, KeyError, OSError, StopIteration) as error:
++            rows.append({"run": path.parent.name, "valid": 0, "errors": str(error)})
++    if not rows:
++        raise SystemExit("nenhuma execução encontrada")
++    baselines = {(r["program"], r["algorithm"], r["work"], r["imbalance"],
++                  r["perturb"], r["cpu"], r["iters"]): r["sim_ticks"]
++                 for r in rows if r["valid"] and r["threads"] == 1}
++    for row in rows:
++        if row["valid"]:
++            baseline = baselines.get(tuple(row[k] for k in
++                ("program", "algorithm", "work", "imbalance", "perturb", "cpu", "iters")))
++            if baseline is not None:
++                row["speedup_p1"] = baseline / row["sim_ticks"]
++                row["efficiency_p1"] = row["speedup_p1"] / row["threads"]
 +    with args.csv.open("w", newline="") as output:
-+        writer = csv.DictWriter(output, fieldnames=rows[0].keys() if rows else ["run", "valid"])
++        fields = list(dict.fromkeys(key for row in rows for key in row))
++        writer = csv.DictWriter(output, fieldnames=fields)
 +        writer.writeheader()
 +        writer.writerows(rows)
 +    if any(not row["valid"] for row in rows):
@@ -278,7 +387,7 @@ index 0000000000..8494dfe63b
 +    main()
 diff --git a/configs/projetos/p02/sistema_p02.py b/configs/projetos/p02/sistema_p02.py
 new file mode 100644
-index 0000000000..3bd372abaf
+index 0000000000..e0ee0d0086
 --- /dev/null
 +++ b/configs/projetos/p02/sistema_p02.py
 @@ -0,0 +1,152 @@
@@ -303,7 +412,7 @@ index 0000000000..3bd372abaf
 +
 +parser.add_argument(
 +    "--prog",
-+    choices=["micro", "jacobi", "integ"],
++    choices=["micro", "micro-noevents", "jacobi", "integ"],
 +    default="micro",
 +)
 +
@@ -434,6 +543,67 @@ index 0000000000..3bd372abaf
 +m5.instantiate()
 +event = m5.simulate()
 +print(f"Fim no tick {m5.curTick()}: {event.getCause()}")
+diff --git a/configs/projetos/p02/test_campanha_p02.py b/configs/projetos/p02/test_campanha_p02.py
+new file mode 100644
+index 0000000000..3ba3a28e89
+--- /dev/null
++++ b/configs/projetos/p02/test_campanha_p02.py
+@@ -0,0 +1,12 @@
++"""python3 configs/projetos/p02/test_campanha_p02.py"""
++from campanha_p02 import combinations
++
++for stage, expected in (("main", 270), ("o3", 24), ("auto", 15), ("smoke", 45)):
++    runs = list(combinations(stage))
++    assert len(runs) == expected
++    assert len(set(runs)) == expected
++    if stage != "smoke":
++        assert {row[5] for row in runs} == {1, 2, 3}
++assert {row[6] for row in combinations("o3")} == {"o3"}
++assert {row[1] for row in combinations("auto")} == {"auto"}
++print("Campaign matrices: 270 main, 24 O3, 15 auto, 45 smoke; no duplicates")
+diff --git a/configs/projetos/p02/test_extrai_p02.py b/configs/projetos/p02/test_extrai_p02.py
+new file mode 100644
+index 0000000000..fe3f772892
+--- /dev/null
++++ b/configs/projetos/p02/test_extrai_p02.py
+@@ -0,0 +1,37 @@
++"""python3 configs/projetos/p02/test_extrai_p02.py"""
++import json
++import tempfile
++from pathlib import Path
++
++from extrai_p02 import extract, read_stats
++
++
++with tempfile.TemporaryDirectory() as directory:
++    root = Path(directory)
++    meta = dict(program="micro", threads=2, iters=3, algorithm="dissem",
++                threshold=4, reference="42")
++    (root / "run.json").write_text(json.dumps(meta))
++    (root / "stdout.txt").write_text("Resultado: 42\nEpisódios medidos: 3\n")
++    path = root / "stats.txt"
++    block = """---------- Begin Simulation Statistics ----------
++simTicks 100
++system.barrier_monitor.arrivals::0 3
++system.barrier_monitor.arrivals::1 3
++system.barrier_monitor.barriersCompleted::0 2
++system.barrier_monitor.barriersCompleted::1 3
++system.barrier_monitor.earlyDepartures 0
++system.barrier_monitor.invalidEvents 0
++system.barrier_monitor.releaseLatency::samples 3
++system.cpu0.dcache.lockedRMWs::total 2
++system.cpu1.dcache.lockedRMWs::total 2
++---------- End Simulation Statistics ----------
++"""
++    path.write_text(block + block.replace("simTicks 100", "simTicks 999"))
++    assert read_stats(path)["simTicks"] == 100
++    assert extract(path)["valid"] == 1
++    path.write_text(block.replace("arrivals::1 3", "arrivals::1 2"))
++    assert extract(path)["valid"] == 0
++    path.write_text(block)
++    (root / "stdout.txt").write_text("Resultado: 41\nEpisódios medidos: 3\n")
++    assert extract(path)["valid"] == 0
++print("ROI selection and rejection of wrong results/arrivals passed")
 diff --git a/include/gem5/asm/generic/m5ops.h b/include/gem5/asm/generic/m5ops.h
 index e0633217ba..34ac1a0388 100644
 --- a/include/gem5/asm/generic/m5ops.h
@@ -1020,35 +1190,43 @@ index 6815e1160b..c588be459e 100644
  
 diff --git a/workloads/p02/Makefile b/workloads/p02/Makefile
 new file mode 100644
-index 0000000000..bb1f0849b3
+index 0000000000..42b454f5b3
 --- /dev/null
 +++ b/workloads/p02/Makefile
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,33 @@
 +CPPFLAGS += -I../../include
 +CXXFLAGS += -O2 -std=c++17 -pthread -Wall -Wextra
++LDFLAGS += -static
++M5LIB = ../../util/m5/build/x86/out/libm5.a
 +
 +COMMON = barreira.cc central.cc dissem.cc
 +PROGRAMS = micro jacobi integ barrier_stress atomic_counter
++HEADERS = barreira.h central.h dissem.h perturb.h
 +
 +all: $(PROGRAMS)
 +
++$(PROGRAMS): $(HEADERS)
++
++micro-noevents: micro.cc $(COMMON) $(HEADERS)
++	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -DUSE_M5OPS -DP02_NO_EVENTS micro.cc $(COMMON) -o $@ $(LDFLAGS) $(M5LIB)
++
 +micro: micro.cc $(COMMON)
-+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -DUSE_M5OPS $^ -o $@ $(LDFLAGS)
++	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -DUSE_M5OPS micro.cc $(COMMON) -o $@ $(LDFLAGS) $(M5LIB)
 +
 +jacobi: jacobi.cc $(COMMON)
-+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -DUSE_M5OPS $^ -o $@ $(LDFLAGS)
++	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -DUSE_M5OPS jacobi.cc $(COMMON) -o $@ $(LDFLAGS) $(M5LIB)
 +
 +integ: integ.cc $(COMMON)
-+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -DUSE_M5OPS $^ -o $@ $(LDFLAGS)
++	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -DUSE_M5OPS integ.cc $(COMMON) -o $@ $(LDFLAGS) $(M5LIB)
 +
 +barrier_stress: barrier_stress.cc $(COMMON)
-+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
++	$(CXX) $(CPPFLAGS) $(CXXFLAGS) barrier_stress.cc $(COMMON) -o $@ $(LDFLAGS)
 +
 +atomic_counter: atomic_counter.cc
-+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -DUSE_M5OPS $< -o $@ $(LDFLAGS)
++	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -DUSE_M5OPS $< -o $@ $(LDFLAGS) $(M5LIB)
 +
 +clean:
-+	rm -f $(PROGRAMS)
++	rm -f $(PROGRAMS) micro-noevents
 diff --git a/workloads/p02/atomic_counter.cc b/workloads/p02/atomic_counter.cc
 new file mode 100644
 index 0000000000..cf73ed7464
@@ -1104,10 +1282,10 @@ index 0000000000..ddc805b3c9
 +}
 diff --git a/workloads/p02/barreira.h b/workloads/p02/barreira.h
 new file mode 100644
-index 0000000000..0050dc5297
+index 0000000000..3064abfa65
 --- /dev/null
 +++ b/workloads/p02/barreira.h
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,63 @@
 +/* Etapa 04 */
 +
 +#pragma once
@@ -1121,7 +1299,11 @@ index 0000000000..0050dc5297
 +
 +#ifdef USE_M5OPS
 +#include <gem5/m5ops.h>
++#ifndef P02_NO_EVENTS
 +#define P02_EVENT(id, phase) m5_barrier((id), (phase))
++#else
++#define P02_EVENT(id, phase) ((void)0)
++#endif
 +#else
 +#define P02_EVENT(id, phase) ((void)0)
 +#endif
@@ -1375,12 +1557,13 @@ index 0000000000..3128633720
 +};
 diff --git a/workloads/p02/integ.cc b/workloads/p02/integ.cc
 new file mode 100644
-index 0000000000..d3d4b135f5
+index 0000000000..7f6261b812
 --- /dev/null
 +++ b/workloads/p02/integ.cc
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,91 @@
 +#include <cstdint>
 +#include <iostream>
++#include <iomanip>
 +#include <memory>
 +#include <string>
 +#include <thread>
@@ -1388,8 +1571,9 @@ index 0000000000..d3d4b135f5
 +
 +#include "barreira.h"
 +#include "central.h"
++#include "perturb.h"
 +
-+struct Params { unsigned threads = 4, iters = 100, work = 10000, threshold = 8; Algorithm algorithm = Algorithm::Central; };
++struct Params { unsigned threads = 4, iters = 100, work = 10000, threshold = 8; uint64_t seed = 0; bool sequential = false; Algorithm algorithm = Algorithm::Central; };
 +
 +static bool parse(Params &p, int argc, char **argv)
 +{
@@ -1400,6 +1584,8 @@ index 0000000000..d3d4b135f5
 +        else if (key == "--iters") p.iters = std::stoul(value);
 +        else if (key == "--work") p.work = std::stoul(value);
 +        else if (key == "--limiar") p.threshold = std::stoul(value);
++        else if (key == "--sequential") p.sequential = value == "1";
++        else if (key == "--perturb") p.seed = std::stoull(value);
 +        else if (key == "--alg") p.algorithm = value == "central" ? Algorithm::Central : value == "dissem" ? Algorithm::Dissem : Algorithm::Auto;
 +        else if (key != "--imbalance" && key != "--perturb") return false;
 +    }
@@ -1412,19 +1598,47 @@ index 0000000000..d3d4b135f5
 +    if (!parse(p, argc, argv)) return 1;
 +    auto measured = createBarrier(p.algorithm, p.threads, 1, p.threshold);
 +    auto control = std::make_unique<CentralBarrier>(p.threads, P02_BARRIER_CTRL);
-+    std::vector<uint64_t> partial(p.threads), result(1);
++    struct alignas(CACHE_LINE) Partial { double value = 0; };
++    std::vector<Partial> partial(p.threads);
++    double parameter = 1.0, result = 0.0;
++    auto integrate = [&](unsigned tid) {
++        double sum = 0.0;
++        const double step = 1.0 / p.work;
++        for (uint64_t i = uint64_t(p.work) * tid / p.threads;
++             i < uint64_t(p.work) * (tid + 1) / p.threads; ++i) {
++            const double x = (i + 0.5) * step;
++            sum += 4.0 / (1.0 + parameter * x * x);
++        }
++        partial[tid].value = sum * step;
++    };
++    auto combine = [&] {
++        double integral = 0.0;
++        for (const auto &value : partial) integral += value.value;
++        result += integral;
++        parameter = 1.0 + integral / 4.0;
++    };
++    if (p.sequential) {
++        for (unsigned it = 0; it < p.iters; ++it) {
++            for (unsigned tid = 0; tid < p.threads; ++tid) integrate(tid);
++            combine();
++        }
++        std::cout << "Resultado: " << std::setprecision(17) << result << "\n";
++        return 0;
++    }
++    std::atomic<bool> roiReady{false};
 +    auto worker = [&](unsigned tid) {
++        initialDelay(p.seed, tid);
 +        control->wait(tid);
 +#ifdef USE_M5OPS
 +        if (tid == 0) m5_reset_stats(0, 0);
 +#endif
++        if (tid == 0) roiReady.store(true, std::memory_order_release);
++        while (!roiReady.load(std::memory_order_acquire)) { }
 +        control->wait(tid);
 +        for (unsigned it = 0; it < p.iters; ++it) {
-+            uint64_t sum = 0;
-+            for (unsigned i = tid; i < p.work; i += p.threads) sum += uint64_t(i) * i + it;
-+            partial[tid] = sum;
++            integrate(tid);
 +            measured->wait(tid);
-+            if (tid == 0) for (uint64_t value : partial) result[0] += value;
++            if (tid == 0) combine();
 +            measured->wait(tid);
 +        }
 +        control->wait(tid);
@@ -1436,14 +1650,15 @@ index 0000000000..d3d4b135f5
 +    for (unsigned tid = 1; tid < p.threads; ++tid) workers.emplace_back(worker, tid);
 +    worker(0);
 +    for (auto &thread : workers) thread.join();
-+    std::cout << "Resultado: " << result[0] << "\nEpisódios medidos: " << 2 * p.iters << "\n";
++    std::cout << "Resultado: " << std::setprecision(17) << result << "\nEpisódios medidos: " << 2 * p.iters << "\n";
 +}
 diff --git a/workloads/p02/jacobi.cc b/workloads/p02/jacobi.cc
 new file mode 100644
-index 0000000000..5f1cf6e2b1
+index 0000000000..f0868debaa
 --- /dev/null
 +++ b/workloads/p02/jacobi.cc
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,105 @@
++#include <algorithm>
 +#include <cstdint>
 +#include <iostream>
 +#include <memory>
@@ -1453,10 +1668,13 @@ index 0000000000..5f1cf6e2b1
 +
 +#include "barreira.h"
 +#include "central.h"
++#include "perturb.h"
 +
 +struct Params {
 +    unsigned threads = 4, iters = 20, size = 128, threshold = 8;
 +    Algorithm algorithm = Algorithm::Central;
++    bool sequential = false;
++    uint64_t seed = 0;
 +};
 +
 +static bool parse(Params &p, int argc, char **argv)
@@ -1468,6 +1686,8 @@ index 0000000000..5f1cf6e2b1
 +        else if (key == "--iters") p.iters = std::stoul(value);
 +        else if (key == "--work") p.size = std::stoul(value);
 +        else if (key == "--limiar") p.threshold = std::stoul(value);
++        else if (key == "--sequential") p.sequential = value == "1";
++        else if (key == "--perturb") p.seed = std::stoull(value);
 +        else if (key == "--alg") {
 +            p.algorithm = value == "central" ? Algorithm::Central :
 +                          value == "dissem" ? Algorithm::Dissem : Algorithm::Auto;
@@ -1482,29 +1702,51 @@ index 0000000000..5f1cf6e2b1
 +    Params p;
 +    if (!parse(p, argc, argv)) return 1;
 +    const size_t cells = size_t(p.size) * p.size;
-+    std::vector<uint64_t> a(cells, 1), b(cells, 0);
++    const size_t offset = (p.seed % 8) * CACHE_LINE / sizeof(uint64_t);
++    std::vector<uint64_t> storageA(cells + offset, 1), storageB(cells + offset, 1);
++    auto *a = storageA.data() + offset;
++    auto *b = storageB.data() + offset;
 +    for (unsigned x = 0; x < p.size; ++x)
 +        a[x] = a[cells - p.size + x] = a[size_t(x) * p.size] = a[size_t(x + 1) * p.size - 1] = 100;
-+    b = a;
++    std::copy(a, a + cells, b);
++
++    if (p.sequential) {
++        for (unsigned it = 0; it < p.iters; ++it) {
++            for (unsigned y = 1; y + 1 < p.size; ++y)
++                for (unsigned x = 1; x + 1 < p.size; ++x) {
++                    const size_t k = size_t(y) * p.size + x;
++                    b[k] = (a[k - p.size] + a[k + p.size] + a[k - 1] + a[k + 1]) / 4;
++                }
++            std::swap(a, b);
++        }
++        uint64_t checksum = 0;
++        for (size_t k = 0; k < cells; ++k) checksum += a[k];
++        std::cout << "Resultado: " << checksum << "\n";
++        return 0;
++    }
 +
 +    auto measured = createBarrier(p.algorithm, p.threads, 1, p.threshold);
 +    CentralBarrier control(p.threads, P02_BARRIER_CTRL);
++    std::atomic<bool> roiReady{false};
 +    auto worker = [&](unsigned tid) {
-+        auto *current = &a;
-+        auto *next = &b;
++        initialDelay(p.seed, tid);
++        auto *current = a;
++        auto *next = b;
 +        const unsigned first = 1 + (p.size - 2) * tid / p.threads;
 +        const unsigned last = 1 + (p.size - 2) * (tid + 1) / p.threads;
 +        control.wait(tid);
 +#ifdef USE_M5OPS
 +        if (tid == 0) m5_reset_stats(0, 0);
 +#endif
++        if (tid == 0) roiReady.store(true, std::memory_order_release);
++        while (!roiReady.load(std::memory_order_acquire)) { }
 +        control.wait(tid);
 +        for (unsigned it = 0; it < p.iters; ++it) {
 +            for (unsigned y = first; y < last; ++y)
 +                for (unsigned x = 1; x + 1 < p.size; ++x)
-+                    (*next)[size_t(y) * p.size + x] = ((*current)[size_t(y - 1) * p.size + x] +
-+                        (*current)[size_t(y + 1) * p.size + x] + (*current)[size_t(y) * p.size + x - 1] +
-+                        (*current)[size_t(y) * p.size + x + 1]) / 4;
++                    next[size_t(y) * p.size + x] = (current[size_t(y - 1) * p.size + x] +
++                        current[size_t(y + 1) * p.size + x] + current[size_t(y) * p.size + x - 1] +
++                        current[size_t(y) * p.size + x + 1]) / 4;
 +            measured->wait(tid);
 +            std::swap(current, next);
 +        }
@@ -1518,15 +1760,15 @@ index 0000000000..5f1cf6e2b1
 +    worker(0);
 +    for (auto &thread : workers) thread.join();
 +    uint64_t checksum = 0;
-+    for (uint64_t value : (p.iters % 2 ? b : a)) checksum += value;
++    for (size_t k = 0; k < cells; ++k) checksum += (p.iters % 2 ? b : a)[k];
 +    std::cout << "Resultado: " << checksum << "\nEpisódios medidos: " << p.iters << "\n";
 +}
 diff --git a/workloads/p02/micro.cc b/workloads/p02/micro.cc
 new file mode 100644
-index 0000000000..5f1f39a8bc
+index 0000000000..25df1c5af5
 --- /dev/null
 +++ b/workloads/p02/micro.cc
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,239 @@
 +/* Listagem 11.13 */
 +/* 11.9 */
 +
@@ -1539,6 +1781,7 @@ index 0000000000..5f1f39a8bc
 +#include <sstream>
 +#include <string>
 +#include "central.h"
++#include "perturb.h"
 +
 +struct Params
 +{
@@ -1551,6 +1794,7 @@ index 0000000000..5f1f39a8bc
 +    uint64_t seed = 1;
 +    Algorithm algorithm = Algorithm::Central;
 +    unsigned threshold = 0;
++    bool sequential = false;
 +};
 +
 +uint64_t
@@ -1582,11 +1826,13 @@ index 0000000000..5f1f39a8bc
 +    const Params &params,
 +    Barrier &measured,
 +    Barrier &control,
++    std::atomic<bool> &roiReady,
 +    uint64_t &result
 +)
 +{
 +    std::mt19937 generator(params.seed + tid);
 +    uint64_t total = 0;
++    initialDelay(params.seed, tid);
 +
 +    // Aquecimento
 +    for (unsigned i = 0; i < params.warmup; i++) {
@@ -1602,6 +1848,8 @@ index 0000000000..5f1f39a8bc
 +    }
 +#endif
 +
++    if (tid == 0) roiReady.store(true, std::memory_order_release);
++    while (!roiReady.load(std::memory_order_acquire)) { }
 +    control.wait(tid);
 +
 +    // Região de interesse.
@@ -1677,6 +1925,8 @@ index 0000000000..5f1f39a8bc
 +            value >> params.seed;
 +        } else if (option == "--limiar") {
 +            value >> params.threshold;
++        } else if (option == "--sequential") {
++            value >> params.sequential;
 +        } else {
 +            std::cerr << "Opção desconhecida: " << option << "\n";
 +            return 1;
@@ -1698,6 +1948,17 @@ index 0000000000..5f1f39a8bc
 +        return 1;
 +    }
 +
++    if (params.sequential) {
++        uint64_t total = 0;
++        for (unsigned tid = 0; tid < params.numThreads; ++tid) {
++            std::mt19937 generator(params.seed + tid);
++            for (unsigned i = 0; i < params.warmup + params.iterations; ++i)
++                total += syntheticWork(tid, params, generator);
++        }
++        std::cout << "Resultado: " << total << "\n";
++        return 0;
++    }
++
 +    std::unique_ptr<Barrier> measured = createBarrier(
 +        params.algorithm,
 +        params.numThreads,
@@ -1711,6 +1972,7 @@ index 0000000000..5f1f39a8bc
 +    }
 +
 +    CentralBarrier control(params.numThreads, P02_BARRIER_CTRL);
++    std::atomic<bool> roiReady{false};
 +
 +    std::vector<uint64_t> results(params.numThreads, 0);
 +    std::vector<std::thread> threads;
@@ -1722,11 +1984,12 @@ index 0000000000..5f1f39a8bc
 +            std::cref(params),
 +            std::ref(*measured),
 +            std::ref(control),
++            std::ref(roiReady),
 +            std::ref(results[tid])
 +        );
 +    }
 +
-+    participant(0, params, *measured, control, results[0]);
++    participant(0, params, *measured, control, roiReady, results[0]);
 +
 +    for (std::thread &thread : threads) {
 +        thread.join();
@@ -1745,6 +2008,68 @@ index 0000000000..5f1f39a8bc
 +
 +    return 0;
 +}
+diff --git a/workloads/p02/perturb.h b/workloads/p02/perturb.h
+new file mode 100644
+index 0000000000..ec8a1e612a
+--- /dev/null
++++ b/workloads/p02/perturb.h
+@@ -0,0 +1,10 @@
++#pragma once
++#include <cstdint>
++
++// Deterministic initial skew, outside the measured region.
++inline void initialDelay(uint64_t seed, unsigned tid)
++{
++    if (!seed) return;
++    const unsigned count = (seed * 1664525 + tid * 1013904223) % 512;
++    for (volatile unsigned i = 0; i < count; ++i) { }
++}
+diff --git a/workloads/p02/test_workloads.py b/workloads/p02/test_workloads.py
+new file mode 100644
+index 0000000000..37dbe050ab
+--- /dev/null
++++ b/workloads/p02/test_workloads.py
+@@ -0,0 +1,40 @@
++#!/usr/bin/env python3
++"""Run with python3 workloads/p02/test_workloads.py (native, no m5ops)."""
++import subprocess
++import math
++import tempfile
++from pathlib import Path
++
++
++SOURCE = Path(__file__).resolve().parent
++
++
++def result(command):
++    output = subprocess.check_output(command, text=True, timeout=30)
++    return next(line for line in output.splitlines() if line.startswith("Resultado:"))
++
++
++with tempfile.TemporaryDirectory() as directory:
++    cases = 0
++    for program in ("micro", "jacobi", "integ"):
++        binary = str(Path(directory) / program)
++        subprocess.run(["g++", "-O2", "-std=c++17", "-pthread",
++                        "-I" + str(SOURCE.parents[1] / "include"),
++                        *[str(SOURCE / (name + ".cc")) for name in
++                          (program, "barreira", "central", "dissem")], "-o", binary], check=True)
++        if program == "integ":
++            actual = float(result([binary, "--sequential", "1", "--threads", "1",
++                                   "--iters", "1", "--work", "10000"]).split(":")[1])
++            assert math.isclose(actual, math.pi, abs_tol=1e-8)
++        if program == "jacobi":
++            assert result([binary, "--sequential", "1", "--work", "3", "--iters", "2"]) == "Resultado: 900"
++        for threads in (1, 2, 3, 4, 8, 16):
++            for iterations in (3, 4):
++                command = [binary, "--threads", str(threads), "--iters", str(iterations),
++                           "--work", "19", "--perturb", "2", "--imbalance", "0.5",
++                           "--limiar", "4"]
++                expected = result(command + ["--sequential", "1"])
++                for algorithm in ("central", "dissem", "auto"):
++                    assert result(command + ["--alg", algorithm]) == expected
++                    cases += 1
++    print(f"{cases} native workload cases match sequential references")
 diff --git a/workloads/p02/teste_m5_barrier.cc b/workloads/p02/teste_m5_barrier.cc
 new file mode 100644
 index 0000000000..bc47eec765
