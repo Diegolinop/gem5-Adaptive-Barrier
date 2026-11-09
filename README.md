@@ -1,7 +1,8 @@
 # gem5 Adaptive Barrier
 
 `barreiras-adaptativas-gem5.patch` contém o projeto completo, incluindo a correção das bordas
-do Jacobi. A partir de um clone limpo do gem5 no commit de `versao-base.txt`:
+do Jacobi e o backport oficial de inicialização do `TimeBuffer` usado pelo O3.
+A partir de um clone limpo do gem5 no commit de `versao-base.txt`:
 
 ```sh
 git checkout 62c7bf284864b83f7308f5e14ca9c80812621c29
@@ -14,6 +15,13 @@ make -C workloads/p02
 
 build/X86/gem5.opt -d m5out/p02-demo configs/projetos/p02/sistema_p02.py \
     --prog micro --threads 2 --alg central --work 0 --iters 20 --cpu timing
+```
+
+No ambiente Fedora usado nos testes, a compilação precisou do pacote
+`zlib-ng-compat-devel` e da seleção explícita do Python 3.12:
+
+```sh
+env PYTHON_CONFIG=/usr/bin/python3.12-config scons -j4 build/X86/gem5.opt
 ```
 
 ## Testes e campanha
